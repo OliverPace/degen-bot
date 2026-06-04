@@ -3,13 +3,11 @@
 #  DEGEN-BOT — Main loop
 #  Paper Trading BTC/USDT 5m
 #
-#  Features:
-#   - Strategia RSI + SMA con filtro volume e trend 1H
-#   - Trailing stop automatico
-#   - Daily loss limit + recovery mode
-#   - Comandi Telegram: /status /balance /stop /resume /report
-#   - Report giornaliero automatico alle 08:00 UTC
+#  Modalità automatica:
+#   - TTY  (Mac locale) → dashboard Rich interattiva
+#   - Cloud (Railway)   → logging semplice su stdout
 # ============================================================
+import sys
 import time
 from datetime import datetime, timezone
 
@@ -20,6 +18,8 @@ from rich.live    import Live
 from rich.console import Group
 from rich         import box
 
+IS_TTY = sys.stdout.isatty()   # True = terminale locale, False = cloud
+
 from config        import (UPDATE_INTERVAL, INITIAL_BALANCE,
                             MTF_REFRESH_MIN, DAILY_REPORT_HOUR_UTC,
                             FUNDING_REFRESH_TICKS, FNG_REFRESH_TICKS)
@@ -29,6 +29,17 @@ from paper_trader  import PaperTrader
 import telegram_notifier as tg
 
 console = Console()
+
+
+def clog(msg: str):
+    """Log unificato: Rich in locale, stdout semplice in cloud."""
+    if IS_TTY:
+        console.log(msg)
+    else:
+        # Rimuove markup Rich per output pulito nei log cloud
+        import re
+        clean = re.sub(r'\[.*?\]', '', msg)
+        print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] {clean}", flush=True)
 
 
 # ── Dashboard ─────────────────────────────────────────────────
@@ -144,12 +155,17 @@ def build_ui(trader: PaperTrader, price: float, sig: dict) -> Group:
 # ── Main loop ─────────────────────────────────────────────────
 
 def main():
-    console.print(Panel(
-        "[bold green]⚡ DEGEN-BOT avviato[/bold green]\n"
-        "[dim]Paper Trading  •  BTC/USDT 5m  •  Ctrl+C per fermare\n"
-        "Comandi Telegram: /status  /balance  /stop  /resume  /report[/dim]",
-        border_style="green"
-    ))
+    mode = "LOCAL (dashboard)" if IS_TTY else "CLOUD (headless)"
+    if IS_TTY:
+        console.print(Panel(
+            f"[bold green]⚡ DEGEN-BOT avviato — {mode}[/bold green]\n"
+            "[dim]Paper Trading  •  BTC/USDT 5m  •  Ctrl+C per fermare\n"
+            "Comandi Telegram: /status  /balance  /stop  /resume  /report[/dim]",
+            border_style="green"
+        ))
+    else:
+        print(f"[BOOT] DEGEN-BOT avviato — {mode}", flush=True)
+        print(f"[BOOT] Paper Trading | BTC/USDT 5m | Balance: ${INITIAL_BALANCE}", flush=True)
 
     trader      = PaperTrader()
     df_1h       = None
@@ -161,16 +177,17 @@ def main():
     funding_counter   = 0
     fng_counter       = 0
 
-    # Notifica avvio su Telegram
     tg.notify_start(trader.balance)
 
-    # Carica il trend 1H immediatamente
     try:
         df_1h = get_klines_1h()
     except Exception:
         pass
 
-    with Live(console=console, refresh_per_second=1, screen=False) as live:
+    # Wrapper: usa Live solo in locale
+    def _run_loop(live=None):
+        nonlocal df_1h, mtf_counter, last_report_date, funding_rate, fng, funding_counter, fng_counter
+
         while True:
             try:
                 # ── 1. Fetch dati ────────────────────────────
@@ -211,42 +228,33 @@ def main():
                 # ── 4. Trailing stop update ─────────────────
                 trader.update_trailing(price)
 
-                # ── 5. Controllo daily loss limit ───────────
+                # ── 5. Daily loss limit ─────────────────────
                 if not trader.daily_stopped and trader.check_daily_loss(equity):
                     trader.daily_stopped = True
                     trader._save()
-                    tg.notify_risk_event(
-                        "DAILY_LOSS_LIMIT",
-                        f"Perdita giornaliera >5% raggiunta.\nBot fermo fino a domani.\n"
-                        f"Equity: ${equity:.2f}"
-                    )
-                    console.log("[bold red]🚨 DAILY LOSS LIMIT — trading sospeso[/bold red]")
+                    tg.notify_risk_event("DAILY_LOSS_LIMIT",
+                        f"Perdita giornaliera >5%.\nBot fermo fino a domani.\nEquity: ${equity:.2f}")
+                    clog("[bold red]DAILY LOSS LIMIT — trading sospeso[/bold red]")
 
                 # ── 6. Recovery mode alert ──────────────────
                 if trader.consec_losses == 3:
-                    tg.notify_risk_event(
-                        "RECOVERY_MODE",
-                        f"3 perdite consecutive.\nSize ridotta al 50% fino al prossimo win."
-                    )
+                    tg.notify_risk_event("RECOVERY_MODE",
+                        "3 perdite consecutive. Size ridotta al 50%.")
 
-                # ── 7. Controlla uscite (SL/TP) ─────────────
+                # ── 7. Uscite SL/TP ─────────────────────────
                 closed = trader.check_exit(price)
                 if closed:
-                    pc = "green" if closed["pnl"] >= 0 else "red"
-                    console.log(
-                        f"[bold]TRADE CHIUSO[/bold]  {closed['direction']} "
-                        f"→ [{pc}]{closed['reason']}[/{pc}]  "
-                        f"[bold {pc}]{'+' if closed['pnl']>=0 else ''}{closed['pnl']:.2f} USDT[/bold {pc}]"
-                        + (" 🎯" if closed.get("trailing_active") else "")
-                    )
+                    sign = "+" if closed["pnl"] >= 0 else ""
+                    clog(f"TRADE CHIUSO {closed['direction']} → {closed['reason']} "
+                         f"{sign}{closed['pnl']:.2f} USDT"
+                         + (" TRAILING" if closed.get("trailing_active") else ""))
                     tg.notify_trade_close(
                         closed["direction"], closed["entry_price"],
                         closed["exit_price"], closed["pnl"],
                         closed["reason"], trader.balance,
-                        closed.get("trailing_active", False)
-                    )
+                        closed.get("trailing_active", False))
 
-                # ── 8. Valuta segnale ────────────────────────
+                # ── 8. Segnale ───────────────────────────────
                 sig = get_signal(df, df_1h, funding_rate, fng)
 
                 # ── 9. Apri posizione ────────────────────────
@@ -255,17 +263,12 @@ def main():
                                             sl_override=sig.get("sl") or None,
                                             tp_override=sig.get("tp") or None):
                         pos = trader.position
-                        sc  = "green" if sig["signal"] == "BUY" else "red"
-                        console.log(
-                            f"[bold]TRADE APERTO[/bold]  "
-                            f"[{sc}]{sig['signal']}[/{sc}] @ ${price:,.2f}"
-                            + (" ⚠ recovery" if pos.get("recovery_mode") else "")
-                        )
+                        clog(f"TRADE APERTO {sig['signal']} @ ${price:,.2f}"
+                             + (" RECOVERY" if pos.get("recovery_mode") else ""))
                         tg.notify_trade_open(
                             sig["signal"], price,
                             pos["stop_loss"], pos["take_profit"],
-                            False, pos.get("recovery_mode", False)
-                        )
+                            False, pos.get("recovery_mode", False))
 
                 # ── 10. Comandi Telegram ─────────────────────
                 for cmd, chat_id in tg.poll_commands():
@@ -274,37 +277,52 @@ def main():
                     elif cmd == "balance":
                         tg.send_balance(price, trader, chat_id)
                     elif cmd == "stop":
-                        trader.paused = True
-                        trader._save()
-                        tg.notify_risk_event("PAUSED", "Trading in pausa. Usa /resume per riprendere.")
-                        console.log("[yellow]⏸ Bot in pausa (comando Telegram)[/yellow]")
+                        trader.paused = True; trader._save()
+                        tg.notify_risk_event("PAUSED", "Trading in pausa. /resume per riprendere.")
+                        clog("Bot in pausa (Telegram)")
                     elif cmd == "resume":
-                        trader.paused = False
-                        trader.daily_stopped = False
-                        trader._save()
+                        trader.paused = False; trader.daily_stopped = False; trader._save()
                         tg.notify_risk_event("RESUMED", "Trading ripreso.")
-                        console.log("[green]▶ Bot ripreso (comando Telegram)[/green]")
+                        clog("Bot ripreso (Telegram)")
                     elif cmd == "report":
                         tg.send_daily_report(price, trader)
 
-                # ── 11. Report automatico 08:00 UTC ─────────
+                # ── 11. Report 08:00 UTC ─────────────────────
                 now_utc = datetime.now(timezone.utc)
                 if (now_utc.hour == DAILY_REPORT_HOUR_UTC
                         and now_utc.strftime("%Y-%m-%d") != last_report_date):
                     tg.send_daily_report(price, trader)
                     last_report_date = now_utc.strftime("%Y-%m-%d")
 
-                # ── 12. Aggiorna dashboard ───────────────────
-                live.update(build_ui(trader, price, sig))
+                # ── 12. Dashboard o log ──────────────────────
+                if live:
+                    live.update(build_ui(trader, price, sig))
+                else:
+                    # Cloud: stampa riga di stato ogni tick
+                    eq   = trader.total_equity(price)
+                    pnl  = eq - INITIAL_BALANCE
+                    sign = "+" if pnl >= 0 else ""
+                    print(f"[{now_utc.strftime('%H:%M:%S')}] BTC ${price:,.0f} | "
+                          f"RSI {sig['rsi']:.1f} | {sig['signal']}"
+                          + (f" ({sig['blocked_by']})" if sig.get('blocked_by') else "")
+                          + f" | Equity ${eq:.2f} ({sign}{pnl:.2f})",
+                          flush=True)
 
             except KeyboardInterrupt:
-                console.print("\n[yellow]Bot fermato. Stato salvato. A presto![/yellow]")
+                clog("Bot fermato. Stato salvato.")
                 break
             except Exception as e:
-                console.log(f"[red]Errore: {e}[/red]")
+                clog(f"Errore: {e}")
                 tg.notify_error(str(e))
 
             time.sleep(UPDATE_INTERVAL)
+
+    # ── Avvia nel modo corretto ──────────────────────────────────
+    if IS_TTY:
+        with Live(console=console, refresh_per_second=1, screen=False) as live:
+            _run_loop(live)
+    else:
+        _run_loop(live=None)
 
 
 if __name__ == "__main__":
