@@ -1,161 +1,301 @@
 #!/usr/bin/env python3
 # ============================================================
-#  DEGEN-BOT — Main loop  (Paper Trading BTC/USDT 5m)
-#  Avvia con:  python main.py
+#  DEGEN-BOT — Main loop
+#  Paper Trading BTC/USDT 5m
+#
+#  Features:
+#   - Strategia RSI + SMA con filtro volume e trend 1H
+#   - Trailing stop automatico
+#   - Daily loss limit + recovery mode
+#   - Comandi Telegram: /status /balance /stop /resume /report
+#   - Report giornaliero automatico alle 08:00 UTC
 # ============================================================
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 from rich.console import Console
 from rich.table   import Table
 from rich.panel   import Panel
 from rich.live    import Live
-from rich.text    import Text
 from rich.console import Group
 from rich         import box
 
-from config           import UPDATE_INTERVAL, INITIAL_BALANCE
-from data_feed        import get_klines, get_current_price
-from strategy         import get_signal
-from paper_trader     import PaperTrader
+from config        import (UPDATE_INTERVAL, INITIAL_BALANCE,
+                            MTF_REFRESH_MIN, DAILY_REPORT_HOUR_UTC,
+                            FUNDING_REFRESH_TICKS, FNG_REFRESH_TICKS)
+from data_feed     import get_klines, get_klines_1h, get_current_price, get_funding_rate, get_fear_greed
+from strategy      import get_signal
+from paper_trader  import PaperTrader
 import telegram_notifier as tg
 
 console = Console()
 
 
-# ----------------------------------------------------------
-#  Dashboard builder
-# ----------------------------------------------------------
-def build_ui(trader: PaperTrader, price: float,
-             signal: str, rsi: float, sma_fast: float, sma_slow: float):
+# ── Dashboard ─────────────────────────────────────────────────
 
+def build_ui(trader: PaperTrader, price: float, sig: dict) -> Group:
     equity  = trader.total_equity(price)
     pnl     = equity - INITIAL_BALANCE
     unreal  = trader.unrealized_pnl(price)
 
-    sign    = lambda v: "+" if v >= 0 else ""
-    color   = lambda v: "green" if v >= 0 else "red"
+    _sign  = lambda v: "+" if v >= 0 else ""
+    _color = lambda v: "green" if v >= 0 else "red"
 
-    sig_col = {"BUY": "bold green", "SELL": "bold red", "HOLD": "yellow"}
+    sig_col   = {"BUY": "bold green", "SELL": "bold red", "HOLD": "yellow"}
+    trend_sym = {"UP": "📈", "DOWN": "📉", "NEUTRAL": "➡️"}
 
-    # ---- Status panel ----
+    # ── Status string ──
+    status_str = ""
+    if trader.paused:
+        status_str = "  [bold yellow]⏸ PAUSA[/bold yellow]"
+    elif trader.daily_stopped:
+        status_str = "  [bold red]🚨 DAILY STOP[/bold red]"
+    elif trader.is_in_recovery():
+        status_str = "  [bold yellow]⚠ RECOVERY[/bold yellow]"
+
     lines = [
-        f"[bold cyan]DEGEN-BOT[/bold cyan]  •  [yellow]PAPER TRADING[/yellow]  •  BTC/USDT 5M  •  {datetime.now().strftime('%H:%M:%S')}",
+        f"[bold cyan]DEGEN-BOT[/bold cyan]  •  [yellow]PAPER TRADING[/yellow]  •  BTC/USDT 5M  •  "
+        f"{datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC{status_str}",
         "",
-        f"[bold]BTC:[/bold]          ${price:>12,.2f}",
-        f"[bold]Balance:[/bold]      ${trader.balance:>12,.2f}",
-        f"[bold]Equity totale:[/bold] ${equity:>11,.2f}",
-        f"[bold {color(pnl)}]P&L netto:    {sign(pnl)}${abs(pnl):>10,.2f}  ({sign(pnl)}{pnl/INITIAL_BALANCE*100:.1f}%)[/bold {color(pnl)}]",
+        f"[bold]BTC:[/bold]           ${price:>12,.2f}",
+        f"[bold]Balance:[/bold]       ${trader.balance:>12,.2f}",
+        f"[bold]Equity:[/bold]        ${equity:>12,.2f}",
+        f"[bold {_color(pnl)}]P&L netto:     "
+        f"{_sign(pnl)}${abs(pnl):>10,.2f}  ({_sign(pnl)}{pnl/INITIAL_BALANCE*100:.1f}%)"
+        f"[/bold {_color(pnl)}]",
     ]
 
+    # Posizione aperta
     if trader.position:
         p = trader.position
+        trail_tag = "  [dim]🎯trailing[/dim]" if p.get("trailing_active") else ""
         lines += [
             "",
-            f"[magenta]━━ POSIZIONE APERTA ━━━━━━━━━━━━━━[/magenta]",
-            f"  {p['direction']}  @  ${p['entry_price']:,.2f}",
+            f"[magenta]━━ POSIZIONE APERTA ━━━━━━━━━━━━━━━━━[/magenta]",
+            f"  {p['direction']}  @  ${p['entry_price']:,.2f}{trail_tag}",
             f"  SL  ${p['stop_loss']:,.2f}   TP  ${p['take_profit']:,.2f}",
-            f"  [bold {color(unreal)}]Unrealized  {sign(unreal)}${abs(unreal):.2f}[/bold {color(unreal)}]",
+            f"  [bold {_color(unreal)}]Unrealized  {_sign(unreal)}${abs(unreal):.2f}"
+            f"[/bold {_color(unreal)}]",
         ]
     else:
         lines += ["", "[dim]Nessuna posizione aperta[/dim]"]
 
+    # Indicatori
+    blocked = f"  [dim]({sig['blocked_by']})[/dim]" if sig.get("blocked_by") else ""
+    volume_tag = "[green]✓[/green]" if sig["volume_ok"] else "[red]✗[/red]"
+    _atr_disp     = sig.get("atr", 0.0) or 0.0
+    _macd_disp    = sig.get("macd_hist", 0.0) or 0.0
+    _soft_disp    = sig.get("soft_score", 0)
+    _fr_disp      = sig.get("funding_rate", 0.0) or 0.0
+    _fng_val_disp = sig.get("fng_value", 50)
+    _fng_lbl_disp = sig.get("fng_label", "N/A")
     lines += [
         "",
-        f"[bold]━━ INDICATORI ━━━━━━━━━━━━━━━━━━━━[/bold]",
-        f"  RSI(14)   {rsi:>6.1f}",
-        f"  SMA {str(9):>2} / {str(21):>2}  {sma_fast:>8.0f} / {sma_slow:>8.0f}",
-        f"  Segnale   [{sig_col[signal]}]{signal}[/{sig_col[signal]}]",
+        f"[bold]━━ INDICATORI ━━━━━━━━━━━━━━━━━━━━━━━[/bold]",
+        f"  RSI(14)      {sig['rsi']:>6.1f}",
+        f"  SMA {str(7):>2}/{str(18):>2}    {sig['sma_fast']:>8.0f} / {sig['sma_slow']:>8.0f}",
+        f"  Volume       {volume_tag}",
+        f"  Trend 1H     {trend_sym.get(sig['trend_1h'],'➡️')} {sig['trend_1h']}",
+        f"  Funding: {_fr_disp*100:.4f}%  F&G: {_fng_val_disp} ({_fng_lbl_disp})",
+        f"  Soft score: {_soft_disp}/3  ATR: {_atr_disp:.0f}",
+        f"  Segnale      [{sig_col[sig['signal']]}]{sig['signal']}[/{sig_col[sig['signal']]}]"
+        + blocked,
         "",
-        f"[bold]━━ STATS ━━━━━━━━━━━━━━━━━━━━━━━━━[/bold]",
-        f"  Trade:    {trader.wins + trader.losses}   Win rate: {trader.win_rate:.1f}%",
-        f"  P&L real: [bold {color(trader.total_pnl)}]{sign(trader.total_pnl)}${abs(trader.total_pnl):.2f}[/bold {color(trader.total_pnl)}]",
+        f"[bold]━━ STATS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/bold]",
+        f"  Trade: {trader.wins + trader.losses}   Win rate: {trader.win_rate:.1f}%"
+        f"   Consec.loss: {trader.consec_losses}",
+        f"  P&L realizzato: "
+        f"[bold {_color(trader.total_pnl)}]{_sign(trader.total_pnl)}${abs(trader.total_pnl):.2f}[/bold {_color(trader.total_pnl)}]",
     ]
 
-    panel = Panel("\n".join(lines), title="[bold green]⚡ DEGEN-BOT[/bold green]",
+    panel = Panel("\n".join(lines),
+                  title="[bold green]⚡ DEGEN-BOT[/bold green]",
                   border_style="green")
 
-    # ---- Trade history table ----
-    table = Table(title="Ultimi Trade", box=box.SIMPLE_HEAD, show_header=True,
+    # Tabella trade
+    table = Table(title="Ultimi Trade", box=box.SIMPLE_HEAD,
                   title_style="bold", header_style="bold dim")
-    table.add_column("Dir",   width=6,  justify="center")
-    table.add_column("Entry", width=11, justify="right")
-    table.add_column("Exit",  width=11, justify="right")
-    table.add_column("P&L",   width=12, justify="right")
-    table.add_column("Motivo",width=12)
-    table.add_column("Ora",   width=8)
+    table.add_column("Dir",    width=6,  justify="center")
+    table.add_column("Entry",  width=11, justify="right")
+    table.add_column("Exit",   width=11, justify="right")
+    table.add_column("P&L",    width=12, justify="right")
+    table.add_column("Motivo", width=13)
+    table.add_column("Ora",    width=8)
 
+    _s = lambda v: "+" if v >= 0 else ""
     for t in reversed(trader.trades[-10:]):
-        dc  = "green"  if t["direction"] == "BUY" else "red"
-        pc  = "green"  if t["pnl"] >= 0 else "red"
-        ts  = t["closed_at"][11:19] if "closed_at" in t else ""
+        dc  = "green" if t["direction"] == "BUY" else "red"
+        pc  = "green" if t["pnl"] >= 0 else "red"
+        trail = " 🎯" if t.get("trailing_active") else ""
+        rec   = " ⚠" if t.get("recovery_mode") else ""
+        ts    = t.get("closed_at", "")[:10+6].replace("T"," ")[11:19]
         table.add_row(
             f"[{dc}]{t['direction']}[/{dc}]",
             f"${t['entry_price']:,.0f}",
             f"${t['exit_price']:,.0f}",
-            f"[{pc}]{sign(t['pnl'])}${abs(t['pnl']):.2f}[/{pc}]",
-            t["reason"],
+            f"[{pc}]{_s(t['pnl'])}${abs(t['pnl']):.2f}[/{pc}]",
+            t["reason"] + trail + rec,
             ts,
         )
 
     return Group(panel, table)
 
 
-# ----------------------------------------------------------
-#  Main loop
-# ----------------------------------------------------------
+# ── Main loop ─────────────────────────────────────────────────
+
 def main():
     console.print(Panel(
         "[bold green]⚡ DEGEN-BOT avviato[/bold green]\n"
-        "[dim]Modalità: PAPER TRADING (nessun soldo reale)\n"
-        f"Balance iniziale: $150.00 USDT  •  BTC/USDT 5m\n"
-        "Premi Ctrl+C per fermare[/dim]",
+        "[dim]Paper Trading  •  BTC/USDT 5m  •  Ctrl+C per fermare\n"
+        "Comandi Telegram: /status  /balance  /stop  /resume  /report[/dim]",
         border_style="green"
     ))
 
-    trader = PaperTrader()
+    trader      = PaperTrader()
+    df_1h       = None
+    mtf_counter = 0
+    last_report_date  = ""
+    last_report_hour  = -1
+    funding_rate      = 0.0
+    fng               = {"value": 50, "label": "Neutral"}
+    funding_counter   = 0
+    fng_counter       = 0
+
+    # Notifica avvio su Telegram
     tg.notify_start(trader.balance)
+
+    # Carica il trend 1H immediatamente
+    try:
+        df_1h = get_klines_1h()
+    except Exception:
+        pass
 
     with Live(console=console, refresh_per_second=1, screen=False) as live:
         while True:
             try:
+                # ── 1. Fetch dati ────────────────────────────
                 df    = get_klines(limit=100)
                 price = get_current_price()
 
-                # 1. Controlla uscite (SL / TP)
+                # ── 2. Aggiorna trend 1H ogni MTF_REFRESH_MIN tick ──
+                mtf_counter += 1
+                if mtf_counter >= MTF_REFRESH_MIN:
+                    try:
+                        df_1h = get_klines_1h()
+                    except Exception:
+                        pass
+                    mtf_counter = 0
+
+                # ── 2b. Aggiorna funding rate ────────────────
+                funding_counter += 1
+                if funding_counter >= FUNDING_REFRESH_TICKS:
+                    try:
+                        funding_rate = get_funding_rate()
+                    except Exception:
+                        pass
+                    funding_counter = 0
+
+                # ── 2c. Aggiorna Fear & Greed ────────────────
+                fng_counter += 1
+                if fng_counter >= FNG_REFRESH_TICKS:
+                    try:
+                        fng = get_fear_greed()
+                    except Exception:
+                        pass
+                    fng_counter = 0
+
+                # ── 3. Reset giornaliero ────────────────────
+                equity = trader.total_equity(price)
+                trader.tick_day(equity)
+
+                # ── 4. Trailing stop update ─────────────────
+                trader.update_trailing(price)
+
+                # ── 5. Controllo daily loss limit ───────────
+                if not trader.daily_stopped and trader.check_daily_loss(equity):
+                    trader.daily_stopped = True
+                    trader._save()
+                    tg.notify_risk_event(
+                        "DAILY_LOSS_LIMIT",
+                        f"Perdita giornaliera >5% raggiunta.\nBot fermo fino a domani.\n"
+                        f"Equity: ${equity:.2f}"
+                    )
+                    console.log("[bold red]🚨 DAILY LOSS LIMIT — trading sospeso[/bold red]")
+
+                # ── 6. Recovery mode alert ──────────────────
+                if trader.consec_losses == 3:
+                    tg.notify_risk_event(
+                        "RECOVERY_MODE",
+                        f"3 perdite consecutive.\nSize ridotta al 50% fino al prossimo win."
+                    )
+
+                # ── 7. Controlla uscite (SL/TP) ─────────────
                 closed = trader.check_exit(price)
                 if closed:
                     pc = "green" if closed["pnl"] >= 0 else "red"
                     console.log(
-                        f"[bold]TRADE CHIUSO[/bold] {closed['direction']} "
+                        f"[bold]TRADE CHIUSO[/bold]  {closed['direction']} "
                         f"→ [{pc}]{closed['reason']}[/{pc}]  "
                         f"[bold {pc}]{'+' if closed['pnl']>=0 else ''}{closed['pnl']:.2f} USDT[/bold {pc}]"
+                        + (" 🎯" if closed.get("trailing_active") else "")
                     )
                     tg.notify_trade_close(
                         closed["direction"], closed["entry_price"],
                         closed["exit_price"], closed["pnl"],
-                        closed["reason"], trader.balance
+                        closed["reason"], trader.balance,
+                        closed.get("trailing_active", False)
                     )
 
-                # 2. Valuta nuovo segnale
-                signal, rsi, sma_fast, sma_slow = get_signal(df)
+                # ── 8. Valuta segnale ────────────────────────
+                sig = get_signal(df, df_1h, funding_rate, fng)
 
-                # 3. Apri posizione se segnale e piatti
-                if signal in ("BUY", "SELL") and trader.position is None:
-                    if trader.open_position(price, signal):
-                        sc = "green" if signal == "BUY" else "red"
+                # ── 9. Apri posizione ────────────────────────
+                if sig["signal"] in ("BUY", "SELL") and trader.position is None:
+                    if trader.open_position(price, sig["signal"],
+                                            sl_override=sig.get("sl") or None,
+                                            tp_override=sig.get("tp") or None):
+                        pos = trader.position
+                        sc  = "green" if sig["signal"] == "BUY" else "red"
                         console.log(
                             f"[bold]TRADE APERTO[/bold]  "
-                            f"[{sc}]{signal}[/{sc}] @ ${price:,.2f}"
+                            f"[{sc}]{sig['signal']}[/{sc}] @ ${price:,.2f}"
+                            + (" ⚠ recovery" if pos.get("recovery_mode") else "")
                         )
-                        pos = trader.position
                         tg.notify_trade_open(
-                            signal, price,
-                            pos["stop_loss"], pos["take_profit"]
+                            sig["signal"], price,
+                            pos["stop_loss"], pos["take_profit"],
+                            False, pos.get("recovery_mode", False)
                         )
 
-                # 4. Aggiorna dashboard
-                live.update(build_ui(trader, price, signal, rsi, sma_fast, sma_slow))
+                # ── 10. Comandi Telegram ─────────────────────
+                for cmd, chat_id in tg.poll_commands():
+                    if cmd == "status":
+                        tg.send_status(price, sig, trader, chat_id)
+                    elif cmd == "balance":
+                        tg.send_balance(price, trader, chat_id)
+                    elif cmd == "stop":
+                        trader.paused = True
+                        trader._save()
+                        tg.notify_risk_event("PAUSED", "Trading in pausa. Usa /resume per riprendere.")
+                        console.log("[yellow]⏸ Bot in pausa (comando Telegram)[/yellow]")
+                    elif cmd == "resume":
+                        trader.paused = False
+                        trader.daily_stopped = False
+                        trader._save()
+                        tg.notify_risk_event("RESUMED", "Trading ripreso.")
+                        console.log("[green]▶ Bot ripreso (comando Telegram)[/green]")
+                    elif cmd == "report":
+                        tg.send_daily_report(price, trader)
+
+                # ── 11. Report automatico 08:00 UTC ─────────
+                now_utc = datetime.now(timezone.utc)
+                if (now_utc.hour == DAILY_REPORT_HOUR_UTC
+                        and now_utc.strftime("%Y-%m-%d") != last_report_date):
+                    tg.send_daily_report(price, trader)
+                    last_report_date = now_utc.strftime("%Y-%m-%d")
+
+                # ── 12. Aggiorna dashboard ───────────────────
+                live.update(build_ui(trader, price, sig))
 
             except KeyboardInterrupt:
                 console.print("\n[yellow]Bot fermato. Stato salvato. A presto![/yellow]")
