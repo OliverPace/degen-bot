@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 secrets_tg.py
 degen_state.json
+backtest_results.json
+optimization_results.json
