@@ -147,7 +147,8 @@ class PaperTrader:
 
     # ── Trade management ──────────────────────────────────────
 
-    def open_position(self, price: float, direction: str) -> bool:
+    def open_position(self, price: float, direction: str,
+                      sl_override: float = None, tp_override: float = None) -> bool:
         if self.position is not None:
             return False
         ok, _ = self.can_trade()
@@ -161,7 +162,10 @@ class PaperTrader:
 
         size = trade_val / price
 
-        if direction == "BUY":
+        if sl_override is not None and tp_override is not None:
+            sl = sl_override
+            tp = tp_override
+        elif direction == "BUY":
             sl = price * (1 - STOP_LOSS_PCT)
             tp = price * (1 + TAKE_PROFIT_PCT)
         else:

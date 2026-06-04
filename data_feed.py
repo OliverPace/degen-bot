@@ -40,3 +40,39 @@ def get_current_price() -> float:
     )
     resp.raise_for_status()
     return float(resp.json()["price"])
+
+
+def get_funding_rate() -> float:
+    """
+    Restituisce il funding rate corrente di BTC perpetual futures.
+    Positivo = troppi long (bearish), Negativo = troppi short (bullish).
+    Ritorna 0.0 in caso di errore.
+    """
+    try:
+        resp = requests.get(
+            "https://fapi.binance.com/fapi/v1/premiumIndex",
+            params={"symbol": "BTCUSDT"},
+            timeout=10
+        )
+        resp.raise_for_status()
+        return float(resp.json()["lastFundingRate"])
+    except Exception:
+        return 0.0
+
+
+def get_fear_greed() -> dict:
+    """
+    Restituisce {"value": int, "label": str} dal Fear & Greed Index.
+    value: 0 (Extreme Fear) → 100 (Extreme Greed).
+    Ritorna {"value": 50, "label": "Neutral"} in caso di errore.
+    """
+    try:
+        resp = requests.get(
+            "https://api.alternative.me/fng/?limit=1",
+            timeout=10
+        )
+        resp.raise_for_status()
+        d = resp.json()["data"][0]
+        return {"value": int(d["value"]), "label": d["value_classification"]}
+    except Exception:
+        return {"value": 50, "label": "Neutral"}

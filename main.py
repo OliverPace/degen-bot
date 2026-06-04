@@ -21,8 +21,9 @@ from rich.console import Group
 from rich         import box
 
 from config        import (UPDATE_INTERVAL, INITIAL_BALANCE,
-                            MTF_REFRESH_MIN, DAILY_REPORT_HOUR_UTC)
-from data_feed     import get_klines, get_klines_1h, get_current_price
+                            MTF_REFRESH_MIN, DAILY_REPORT_HOUR_UTC,
+                            FUNDING_REFRESH_TICKS, FNG_REFRESH_TICKS)
+from data_feed     import get_klines, get_klines_1h, get_current_price, get_funding_rate, get_fear_greed
 from strategy      import get_signal
 from paper_trader  import PaperTrader
 import telegram_notifier as tg
@@ -82,6 +83,12 @@ def build_ui(trader: PaperTrader, price: float, sig: dict) -> Group:
     # Indicatori
     blocked = f"  [dim]({sig['blocked_by']})[/dim]" if sig.get("blocked_by") else ""
     volume_tag = "[green]✓[/green]" if sig["volume_ok"] else "[red]✗[/red]"
+    _atr_disp     = sig.get("atr", 0.0) or 0.0
+    _macd_disp    = sig.get("macd_hist", 0.0) or 0.0
+    _soft_disp    = sig.get("soft_score", 0)
+    _fr_disp      = sig.get("funding_rate", 0.0) or 0.0
+    _fng_val_disp = sig.get("fng_value", 50)
+    _fng_lbl_disp = sig.get("fng_label", "N/A")
     lines += [
         "",
         f"[bold]━━ INDICATORI ━━━━━━━━━━━━━━━━━━━━━━━[/bold]",
@@ -89,6 +96,8 @@ def build_ui(trader: PaperTrader, price: float, sig: dict) -> Group:
         f"  SMA {str(7):>2}/{str(18):>2}    {sig['sma_fast']:>8.0f} / {sig['sma_slow']:>8.0f}",
         f"  Volume       {volume_tag}",
         f"  Trend 1H     {trend_sym.get(sig['trend_1h'],'➡️')} {sig['trend_1h']}",
+        f"  Funding: {_fr_disp*100:.4f}%  F&G: {_fng_val_disp} ({_fng_lbl_disp})",
+        f"  Soft score: {_soft_disp}/3  ATR: {_atr_disp:.0f}",
         f"  Segnale      [{sig_col[sig['signal']]}]{sig['signal']}[/{sig_col[sig['signal']]}]"
         + blocked,
         "",
@@ -147,6 +156,10 @@ def main():
     mtf_counter = 0
     last_report_date  = ""
     last_report_hour  = -1
+    funding_rate      = 0.0
+    fng               = {"value": 50, "label": "Neutral"}
+    funding_counter   = 0
+    fng_counter       = 0
 
     # Notifica avvio su Telegram
     tg.notify_start(trader.balance)
@@ -172,6 +185,24 @@ def main():
                     except Exception:
                         pass
                     mtf_counter = 0
+
+                # ── 2b. Aggiorna funding rate ────────────────
+                funding_counter += 1
+                if funding_counter >= FUNDING_REFRESH_TICKS:
+                    try:
+                        funding_rate = get_funding_rate()
+                    except Exception:
+                        pass
+                    funding_counter = 0
+
+                # ── 2c. Aggiorna Fear & Greed ────────────────
+                fng_counter += 1
+                if fng_counter >= FNG_REFRESH_TICKS:
+                    try:
+                        fng = get_fear_greed()
+                    except Exception:
+                        pass
+                    fng_counter = 0
 
                 # ── 3. Reset giornaliero ────────────────────
                 equity = trader.total_equity(price)
@@ -216,11 +247,13 @@ def main():
                     )
 
                 # ── 8. Valuta segnale ────────────────────────
-                sig = get_signal(df, df_1h)
+                sig = get_signal(df, df_1h, funding_rate, fng)
 
                 # ── 9. Apri posizione ────────────────────────
                 if sig["signal"] in ("BUY", "SELL") and trader.position is None:
-                    if trader.open_position(price, sig["signal"]):
+                    if trader.open_position(price, sig["signal"],
+                                            sl_override=sig.get("sl") or None,
+                                            tp_override=sig.get("tp") or None):
                         pos = trader.position
                         sc  = "green" if sig["signal"] == "BUY" else "red"
                         console.log(

@@ -52,3 +52,39 @@ UPDATE_INTERVAL = 30   # secondi tra ogni tick
 
 # ── Report giornaliero ───────────────────────────────────────
 DAILY_REPORT_HOUR_UTC = 8   # invia report alle 08:00 UTC
+
+# ── MACD ─────────────────────────────────────────────────────
+MACD_FAST   = 12
+MACD_SLOW   = 26
+MACD_SIGNAL = 9
+
+# ── ATR dinamico ─────────────────────────────────────────────
+ATR_PERIOD   = 14
+ATR_SL_MULT  = 1.5    # SL = ATR * 1.5
+ATR_TP_MULT  = 2.5    # TP = ATR * 2.5
+ATR_MIN_PCT  = 0.0015 # ATR/price min (mercato troppo piatto)
+ATR_MAX_PCT  = 0.012  # ATR/price max (mercato troppo volatile)
+
+# ── Filtro orario (UTC) ───────────────────────────────────────
+TIME_FILTER = True
+# (ora_inizio_h, ora_inizio_m, ora_fine_h, ora_fine_m) UTC
+AVOID_WINDOWS_UTC = [
+    (12, 20, 12, 45),  # 12:30 UTC = 8:30 ET macro USA
+    (13, 20, 13, 50),  # 13:30 UTC = 9:30 ET apertura NYSE
+    (18, 20, 18, 50),  # 18:30 UTC = 14:30 ET macro pomeriggio
+]
+
+# ── Funding rate (Binance Futures) ────────────────────────────
+FUNDING_BULLISH_THRESHOLD = -0.0003  # < -0.03% → troppi short → BUY bias
+FUNDING_BEARISH_THRESHOLD =  0.0003  # >  0.03% → troppi long  → SELL bias
+FUNDING_REFRESH_TICKS     = 60       # aggiorna ogni 60 tick (~30 min)
+
+# ── Fear & Greed Index ────────────────────────────────────────
+FNG_FEAR_MAX   = 30   # <= 30 = Extreme Fear → BUY bias
+FNG_GREED_MIN  = 70   # >= 70 = Extreme Greed → SELL bias
+FNG_REFRESH_TICKS = 120  # aggiorna ogni 120 tick (~1 ora)
+
+# ── Scoring ───────────────────────────────────────────────────
+# Filtri HARD (tutti devono passare): volume, ATR, time, MACD
+# Conferme SOFT (serve min 1 su 3): trend_1h, funding, fear&greed
+MIN_SOFT_CONFIRMATIONS = 1

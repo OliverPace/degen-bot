@@ -23,7 +23,10 @@ from rich.columns import Columns
 from rich.text    import Text
 from rich         import box
 
-from config import BINANCE_BASE_URL, SYMBOL, INTERVAL
+from config import (BINANCE_BASE_URL, SYMBOL, INTERVAL,
+                    MACD_FAST, MACD_SLOW, MACD_SIGNAL,
+                    ATR_PERIOD, ATR_SL_MULT, ATR_TP_MULT,
+                    ATR_MIN_PCT, ATR_MAX_PCT)
 
 console = Console()
 
@@ -84,6 +87,18 @@ def _rsi(s: pd.Series, p: int) -> pd.Series:
 def _sma(s: pd.Series, p: int) -> pd.Series:
     return s.rolling(p).mean()
 
+def _macd_hist(s: pd.Series) -> pd.Series:
+    ema_f  = s.ewm(span=MACD_FAST,   adjust=False).mean()
+    ema_s  = s.ewm(span=MACD_SLOW,   adjust=False).mean()
+    line   = ema_f - ema_s
+    signal = line.ewm(span=MACD_SIGNAL, adjust=False).mean()
+    return line - signal
+
+def _atr(df: pd.DataFrame) -> pd.Series:
+    hi, lo, cp = df["high"], df["low"], df["close"].shift(1)
+    tr = pd.concat([(hi-lo), (hi-cp).abs(), (lo-cp).abs()], axis=1).max(axis=1)
+    return tr.rolling(ATR_PERIOD).mean()
+
 
 # ============================================================
 #  3. MOTORE DI SIMULAZIONE
@@ -110,18 +125,20 @@ def run_backtest(df: pd.DataFrame, params: dict,
     sl_p = params["stop_loss_pct"]
     tp_p = params["take_profit_pct"]
 
-    closes = df["close"]
-    rsi    = _rsi(closes, rp)
-    smaf   = _sma(closes, sf)
-    smas   = _sma(closes, ss)
+    closes   = df["close"]
+    rsi      = _rsi(closes, rp)
+    smaf     = _sma(closes, sf)
+    smas     = _sma(closes, ss)
+    macd_h   = _macd_hist(closes)
+    atr_vals = _atr(df)
 
     balance   = initial_balance
     position  = None
     trades    = []
-    equity    = []          # equity curve tick-by-tick
+    equity    = []
     drawdowns = []
 
-    start = max(rp + 1, ss + 1)
+    start = max(rp + 1, ss + 1, MACD_SLOW + MACD_SIGNAL, ATR_PERIOD + 1)
 
     for i in range(start, len(df)):
         row = df.iloc[i]
@@ -133,10 +150,21 @@ def run_backtest(df: pd.DataFrame, params: dict,
         cur_rsi  = rsi.iloc[i]
         cur_smaf = smaf.iloc[i]
         cur_smas = smas.iloc[i]
+        cur_macd  = macd_h.iloc[i]
+        prev_macd = macd_h.iloc[i-1] if i > 0 else cur_macd
+        cur_atr   = atr_vals.iloc[i]
 
-        if pd.isna(cur_rsi) or pd.isna(cur_smaf) or pd.isna(cur_smas):
+        if pd.isna(cur_rsi) or pd.isna(cur_smaf) or pd.isna(cur_smas) or pd.isna(cur_macd) or pd.isna(cur_atr):
             equity.append(balance)
             continue
+
+        # ATR volatility filter (hard)
+        atr_pct = cur_atr / price if price > 0 else 0
+        atr_ok  = ATR_MIN_PCT <= atr_pct <= ATR_MAX_PCT
+
+        # MACD inversione (soft — +1 punto se confermato)
+        macd_up   = cur_macd > prev_macd   # istogramma in salita → bullish
+        macd_down = cur_macd < prev_macd   # istogramma in discesa → bearish
 
         # ── Gestione uscita posizione aperta ─────────────────────
         if position:
@@ -203,18 +231,30 @@ def run_backtest(df: pd.DataFrame, params: dict,
             else:
                 sig = None
 
+            # Hard filter: ATR
+            if sig and not atr_ok: sig = None
+
+            # Soft: MACD inversione + MIN_SOFT_CONFIRMATIONS=1
+            if sig:
+                soft = 0
+                if sig == "BUY"  and macd_up:   soft += 1
+                if sig == "SELL" and macd_down:  soft += 1
+                # (trend 1H e funding/F&G non disponibili su dati storici)
+                if soft < 1: sig = None  # nessuna conferma soft → skip
+
             if sig:
                 trade_val = balance * 0.95
                 if trade_val < 1:
                     continue
                 size = trade_val / price
 
+                # ATR-based SL/TP
                 if sig == "BUY":
-                    sl_price = price * (1 - sl_p)
-                    tp_price = price * (1 + tp_p)
+                    sl_price = price - cur_atr * ATR_SL_MULT
+                    tp_price = price + cur_atr * ATR_TP_MULT
                 else:
-                    sl_price = price * (1 + sl_p)
-                    tp_price = price * (1 - tp_p)
+                    sl_price = price + cur_atr * ATR_SL_MULT
+                    tp_price = price - cur_atr * ATR_TP_MULT
 
                 balance -= trade_val
                 position = {
