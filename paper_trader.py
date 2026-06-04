@@ -1,108 +1,206 @@
 # ============================================================
 #  DEGEN-BOT — Paper Trading Engine
+#  Trailing stop | Daily loss limit | Recovery mode
 # ============================================================
 import json
 import os
-from datetime import datetime
-from config import INITIAL_BALANCE, STOP_LOSS_PCT, TAKE_PROFIT_PCT, TRADE_SIZE_PCT
+from datetime import datetime, timezone
+from config import (
+    INITIAL_BALANCE, STOP_LOSS_PCT, TAKE_PROFIT_PCT, TRADE_SIZE_PCT,
+    TRAILING_ENABLED, TRAILING_ACTIVATE_PCT, TRAILING_OFFSET_PCT,
+    MAX_DAILY_LOSS_PCT, MAX_CONSEC_LOSSES, RECOVERY_SIZE_PCT,
+)
 
 STATE_FILE = "degen_state.json"
 
 
 class PaperTrader:
+
     def __init__(self):
-        self.balance   = INITIAL_BALANCE
-        self.position  = None   # dict when open, None when flat
-        self.trades    = []
-        self.total_pnl = 0.0
-        self.wins      = 0
-        self.losses    = 0
+        self.balance        = INITIAL_BALANCE
+        self.position       = None
+        self.trades         = []
+        self.total_pnl      = 0.0
+        self.wins           = 0
+        self.losses         = 0
+        # Risk management state
+        self.consec_losses  = 0      # perdite consecutive correnti
+        self.paused         = False  # True = bot in pausa manuale (/stop)
+        self.daily_start_eq = INITIAL_BALANCE   # equity all'inizio del giorno
+        self.daily_date     = self._today()
+        self.daily_stopped  = False  # True = daily loss limit raggiunto
         self._load()
 
-    # ----------------------------------------------------------
-    #  Persistence
-    # ----------------------------------------------------------
+    # ── Persistence ───────────────────────────────────────────
+
+    @staticmethod
+    def _today() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
     def _load(self):
-        if os.path.exists(STATE_FILE):
-            try:
-                with open(STATE_FILE) as f:
-                    s = json.load(f)
-                self.balance   = s.get("balance",   INITIAL_BALANCE)
-                self.position  = s.get("position",  None)
-                self.trades    = s.get("trades",    [])
-                self.total_pnl = s.get("total_pnl", 0.0)
-                self.wins      = s.get("wins",      0)
-                self.losses    = s.get("losses",    0)
-            except Exception:
-                pass  # file corrotto → riparte da zero
+        if not os.path.exists(STATE_FILE):
+            return
+        try:
+            with open(STATE_FILE) as f:
+                s = json.load(f)
+            self.balance        = s.get("balance",        INITIAL_BALANCE)
+            self.position       = s.get("position",       None)
+            self.trades         = s.get("trades",         [])
+            self.total_pnl      = s.get("total_pnl",      0.0)
+            self.wins           = s.get("wins",           0)
+            self.losses         = s.get("losses",         0)
+            self.consec_losses  = s.get("consec_losses",  0)
+            self.paused         = s.get("paused",         False)
+            self.daily_start_eq = s.get("daily_start_eq", INITIAL_BALANCE)
+            self.daily_date     = s.get("daily_date",     self._today())
+            self.daily_stopped  = s.get("daily_stopped",  False)
+        except Exception:
+            pass
 
     def _save(self):
         state = {
-            "balance":   self.balance,
-            "position":  self.position,
-            "trades":    self.trades[-100:],   # ultimi 100
-            "total_pnl": self.total_pnl,
-            "wins":      self.wins,
-            "losses":    self.losses,
+            "balance":        self.balance,
+            "position":       self.position,
+            "trades":         self.trades[-100:],
+            "total_pnl":      self.total_pnl,
+            "wins":           self.wins,
+            "losses":         self.losses,
+            "consec_losses":  self.consec_losses,
+            "paused":         self.paused,
+            "daily_start_eq": self.daily_start_eq,
+            "daily_date":     self.daily_date,
+            "daily_stopped":  self.daily_stopped,
         }
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=2)
 
-    # ----------------------------------------------------------
-    #  Trade management
-    # ----------------------------------------------------------
+    # ── Daily reset ───────────────────────────────────────────
+
+    def tick_day(self, current_equity: float):
+        """
+        Chiamato ad ogni tick. Resetta i contatori giornalieri
+        se è cambiata la data UTC.
+        """
+        today = self._today()
+        if today != self.daily_date:
+            self.daily_date     = today
+            self.daily_start_eq = current_equity
+            self.daily_stopped  = False
+            self._save()
+
+    # ── Risk checks ───────────────────────────────────────────
+
+    def check_daily_loss(self, current_equity: float) -> bool:
+        """True se il limite di perdita giornaliera è stato superato."""
+        if self.daily_start_eq <= 0:
+            return False
+        loss_pct = (current_equity - self.daily_start_eq) / self.daily_start_eq
+        return loss_pct < -MAX_DAILY_LOSS_PCT
+
+    def is_in_recovery(self) -> bool:
+        return self.consec_losses >= MAX_CONSEC_LOSSES
+
+    def _effective_trade_size(self) -> float:
+        """Size ridotta in recovery mode."""
+        if self.is_in_recovery():
+            return TRADE_SIZE_PCT * RECOVERY_SIZE_PCT
+        return TRADE_SIZE_PCT
+
+    def can_trade(self) -> tuple[bool, str]:
+        """
+        Restituisce (True, '') se il bot può aprire nuovi trade,
+        oppure (False, motivo) se è bloccato.
+        """
+        if self.paused:
+            return False, "PAUSED"
+        if self.daily_stopped:
+            return False, "DAILY_LOSS_LIMIT"
+        return True, ""
+
+    # ── Trailing stop update ──────────────────────────────────
+
+    def update_trailing(self, price: float):
+        """Aggiorna il trailing stop se la posizione è in profitto sufficiente."""
+        if not TRAILING_ENABLED or self.position is None:
+            return
+
+        p     = self.position
+        entry = p["entry_price"]
+        d     = p["direction"]
+
+        if d == "BUY":
+            profit_pct = (price - entry) / entry
+            if profit_pct >= TRAILING_ACTIVATE_PCT:
+                new_sl = price * (1 - TRAILING_OFFSET_PCT)
+                if new_sl > p["stop_loss"]:   # il trailing sale, mai scende
+                    p["stop_loss"] = new_sl
+                    p["trailing_active"] = True
+                    self._save()
+        else:  # SELL
+            profit_pct = (entry - price) / entry
+            if profit_pct >= TRAILING_ACTIVATE_PCT:
+                new_sl = price * (1 + TRAILING_OFFSET_PCT)
+                if new_sl < p["stop_loss"]:   # il trailing scende, mai sale
+                    p["stop_loss"] = new_sl
+                    p["trailing_active"] = True
+                    self._save()
+
+    # ── Trade management ──────────────────────────────────────
+
     def open_position(self, price: float, direction: str) -> bool:
-        """Apre una nuova posizione. Ritorna False se già aperta."""
         if self.position is not None:
             return False
+        ok, _ = self.can_trade()
+        if not ok:
+            return False
 
-        trade_value = self.balance * TRADE_SIZE_PCT
-        if trade_value < 1:
-            return False   # balance troppo basso
+        size_pct  = self._effective_trade_size()
+        trade_val = self.balance * size_pct
+        if trade_val < 1:
+            return False
 
-        size = trade_value / price  # quantità BTC
+        size = trade_val / price
 
         if direction == "BUY":
             sl = price * (1 - STOP_LOSS_PCT)
             tp = price * (1 + TAKE_PROFIT_PCT)
-        else:  # SELL (short simulato)
+        else:
             sl = price * (1 + STOP_LOSS_PCT)
             tp = price * (1 - TAKE_PROFIT_PCT)
 
         self.position = {
-            "direction":   direction,
-            "entry_price": price,
-            "size":        size,
-            "stop_loss":   sl,
-            "take_profit": tp,
-            "opened_at":   datetime.now().isoformat(),
+            "direction":       direction,
+            "entry_price":     price,
+            "size":            size,
+            "stop_loss":       sl,
+            "take_profit":     tp,
+            "trailing_active": False,
+            "opened_at":       datetime.now(timezone.utc).isoformat(),
+            "recovery_mode":   self.is_in_recovery(),
         }
-        self.balance -= trade_value
+        self.balance -= trade_val
         self._save()
         return True
 
     def check_exit(self, price: float) -> dict | None:
-        """Controlla SL/TP e chiude la posizione se necessario."""
         if self.position is None:
             return None
 
-        p   = self.position
-        hit = None
+        p  = self.position
+        d  = p["direction"]
+        sl = p["stop_loss"]
+        tp = p["take_profit"]
 
-        if p["direction"] == "BUY":
-            if price <= p["stop_loss"]:
-                hit = "STOP_LOSS"
-            elif price >= p["take_profit"]:
-                hit = "TAKE_PROFIT"
+        if d == "BUY":
+            if price <= sl:  hit = "STOP_LOSS"
+            elif price >= tp: hit = "TAKE_PROFIT"
+            else:             return None
         else:
-            if price >= p["stop_loss"]:
-                hit = "STOP_LOSS"
-            elif price <= p["take_profit"]:
-                hit = "TAKE_PROFIT"
+            if price >= sl:  hit = "STOP_LOSS"
+            elif price <= tp: hit = "TAKE_PROFIT"
+            else:             return None
 
-        if hit:
-            return self._close(price, hit)
-        return None
+        return self._close(price, hit)
 
     def _close(self, price: float, reason: str) -> dict:
         p = self.position
@@ -112,37 +210,40 @@ class PaperTrader:
         else:
             pnl = (p["entry_price"] - price) * p["size"]
 
-        pnl_pct = pnl / (p["entry_price"] * p["size"]) * 100
-        self.balance   += p["entry_price"] * p["size"] + pnl
+        pnl_pct        = pnl / (p["entry_price"] * p["size"]) * 100
+        self.balance  += p["entry_price"] * p["size"] + pnl
         self.total_pnl += pnl
 
         if pnl >= 0:
-            self.wins += 1
+            self.wins         += 1
+            self.consec_losses = 0
         else:
-            self.losses += 1
+            self.losses        += 1
+            self.consec_losses += 1
 
         trade = {
-            "direction":   p["direction"],
-            "entry_price": round(p["entry_price"], 2),
-            "exit_price":  round(price, 2),
-            "pnl":         round(pnl, 4),
-            "pnl_pct":     round(pnl_pct, 2),
-            "reason":      reason,
-            "opened_at":   p["opened_at"],
-            "closed_at":   datetime.now().isoformat(),
+            "direction":       p["direction"],
+            "entry_price":     round(p["entry_price"], 2),
+            "exit_price":      round(price, 2),
+            "pnl":             round(pnl, 4),
+            "pnl_pct":         round(pnl_pct, 2),
+            "reason":          reason,
+            "trailing_active": p.get("trailing_active", False),
+            "recovery_mode":   p.get("recovery_mode", False),
+            "opened_at":       p["opened_at"],
+            "closed_at":       datetime.now(timezone.utc).isoformat(),
         }
         self.trades.append(trade)
         self.position = None
         self._save()
         return trade
 
-    # ----------------------------------------------------------
-    #  Helper properties
-    # ----------------------------------------------------------
+    # ── Helpers ───────────────────────────────────────────────
+
     @property
     def win_rate(self) -> float:
-        total = self.wins + self.losses
-        return (self.wins / total * 100) if total else 0.0
+        t = self.wins + self.losses
+        return (self.wins / t * 100) if t else 0.0
 
     def unrealized_pnl(self, price: float) -> float:
         if self.position is None:
@@ -153,6 +254,6 @@ class PaperTrader:
         return (p["entry_price"] - price) * p["size"]
 
     def total_equity(self, price: float) -> float:
-        pos_value = (self.position["entry_price"] * self.position["size"]
-                     if self.position else 0.0)
-        return self.balance + pos_value + self.unrealized_pnl(price)
+        pos_val = (self.position["entry_price"] * self.position["size"]
+                   if self.position else 0.0)
+        return self.balance + pos_val + self.unrealized_pnl(price)
